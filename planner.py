@@ -4,25 +4,40 @@
 import json, os, re, pathlib
 from typing import Optional, List, Dict
 
-# Planning prompt template
-PLANNING_PROMPT = """你是一个任务拆解专家。用户提出了一个任务，请拆解成具体的执行步骤。
+# Planning prompt - v2: 更强的类型约束 + 依赖分析
+PLANNING_PROMPT_V2 = """你是一个任务拆解专家。用户提出了一个任务，请拆解成具体的执行步骤。
 
 任务：TASK_PLACEHOLDER
 
-请按以下 JSON 格式输出步骤列表（不要输出其他内容）：
-{ "steps": [ { "description": "步骤描述", "type": "cmd|write|read" } ] }
+请严格按照以下 JSON Schema 输出（只输出 JSON，不要任何其他内容）：
+{
+  "steps": [
+    {
+      "description": "步骤描述（动词开头，如"编写用户认证模块"）",
+      "type": "read | write | cmd",
+      "files_read": ["读取的文件路径（仅 type=read 时需要）"],
+      "files_write": ["写入的文件路径（仅 type=write 时需要）"]
+    }
+  ]
+}
 
-步骤类型规则：
-- read: 分析/调研/获取/下载/读取/理解/查看（信息获取类）
-- write: 创建/编写/开发/设计/搭建/实现/配置/保存/导出/生成/画/制作（生产创造类）
-- cmd: 运行/测试/部署/安装/执行/启动/验证/清理（执行操作类）
+步骤类型定义（必须严格遵守）：
+- read:   分析/调研/获取数据/查看文档/理解需求/抓取数据
+         示例："调研股票数据API"，"分析页面结构"，"理解需求文档"
+- write:  创建/编写/开发/设计/搭建/配置/实现/生成/绘制/制作任何文件
+         示例："编写K线图渲染模块"，"创建数据库表"，"设计API接口"
+- cmd:    运行/测试/安装/部署/启动/验证/构建/执行命令
+         示例："运行单元测试"，"部署到服务器"，"安装依赖"
 
-原则：
-- 大部分步骤应该是 write 类型（开发任务的核心是创建东西）
-- read 类型只在明确需要"先调研/分析"时使用
-- cmd 类型只在运行/测试/部署时使用
-- 每个步骤应该可以独立验证
-- 步骤数量建议 3-8 步
+重要规则：
+1. type 必须是 read/write/cmd 之一，大小写敏感！
+2. type=write 必须填写 files_write（至少一个文件路径）
+3. type=read 可以填写 files_read（被读取的文件）
+4. type=cmd 通常不写 files_write（纯命令执行）
+5. 步骤数量：3-8 步，优先 4-6 步
+6. 描述要具体、动词开头，包含关键动作和产物
+
+返回 JSON（只返回 JSON）：
 """
 
 
@@ -80,7 +95,7 @@ def parse_plan_from_text(text: str) -> List[Dict]:
     patterns = [
         r"```json\s*(.*?)\s*```",
         r"```\s*(.*?)\s*```",
-        r'\{[^{}]*?"steps"\s*:\s*\[.*?\]\s*\}',
+        r'\{.*?"steps"\s*:\s*\[.*?\]\s*\}',
     ]
     for pat in patterns:
         m = re.search(pat, text, re.DOTALL)
@@ -89,7 +104,19 @@ def parse_plan_from_text(text: str) -> List[Dict]:
                 raw = m.group(1) if m.lastindex else m.group(0)
                 data = json.loads(raw)
                 if "steps" in data and isinstance(data["steps"], list):
-                    return data["steps"]
+                    # 标准化字段：补全 files_read / files_write
+                    steps = []
+                    for s in data["steps"]:
+                        t = s.get("type", "cmd").lower().strip()
+                        if t not in ("read", "write", "cmd"):
+                            t = _guess_step_type(s.get("description", ""))
+                        steps.append({
+                            "description": s.get("description", ""),
+                            "type": t,
+                            "files_read": s.get("files_read") or [],
+                            "files_write": s.get("files_write") or [],
+                        })
+                    return steps
             except Exception:
                 continue
     return []
@@ -216,7 +243,7 @@ def quick_parse(task: str) -> List[Dict]:
 
 def plan_task(task: str, context: str = "") -> List[Dict]:
     """主入口：给定任务，返回结构化步骤列表"""
-    prompt = PLANNING_PROMPT.replace("TASK_PLACEHOLDER", task)
+    prompt = PLANNING_PROMPT_V2.replace("TASK_PLACEHOLDER", task)
     if context:
         prompt += "\n\n当前项目上下文：\n" + context[:500]
     result = call_openclaw_model(prompt)
