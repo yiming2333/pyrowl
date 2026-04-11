@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 # pyrowl/workflow.py - M1: 核心状态机 + 持久化
 
-import json, os, time, uuid
+import json, os, re, time, uuid
 from pathlib import Path
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List, Dict, Any
 
-PYROWL_DIR = Path.home() / ".qclaw" / "pyrowl"
+PYROWL_DIR = Path(r"D:\QClaw_workspace\.qclaw\pyrowl")
 WORKFLOWS_DIR = PYROWL_DIR / "workflows"
 WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -38,13 +38,19 @@ class StepStatus(str, Enum):
 
 class Step:
     def __init__(self, sid, description, step_type, action=None,
-                 validation=None, rollback=None):
+                 validation=None, rollback=None,
+                 files_read=None, files_write=None,
+                 parallel_group=None):
         self.id = sid
         self.description = description
         self.type = step_type
         self.action = action
         self.validation = validation or {}
         self.rollback = rollback
+        # 并行执行支持：读写文件列表 + 并行组号
+        self.files_read = files_read or []   # 读取的文件路径（用于依赖分析）
+        self.files_write = files_write or []  # 写入的文件路径（用于依赖分析）
+        self.parallel_group = parallel_group  # None=串行, >0=并行组号
         self.status = StepStatus.PENDING
         self.result = None
         self.error = None
@@ -90,10 +96,12 @@ class WorkflowRecord:
         self._counter = 0
 
     def add_step(self, description, step_type, action=None,
-                 validation=None, rollback=None):
+                 validation=None, rollback=None,
+                 files_read=None, files_write=None):
         self._counter += 1
         t = step_type.value if hasattr(step_type, "value") else step_type
-        st = Step(self._counter - 1, description, StepType(t), action, validation, rollback)
+        st = Step(self._counter - 1, description, StepType(t), action, validation, rollback,
+                  files_read, files_write)
         self.steps.append(st)
         return st
 
@@ -182,8 +190,11 @@ class WorkflowOrchestrator:
         self._wf = WorkflowRecord(task, self.chat_id)
         if steps:
             for s in steps:
-                self._wf.add_step(s["description"], s.get("type", "cmd"),
-                                  s.get("action"), s.get("validation"), s.get("rollback"))
+                self._wf.add_step(
+                    s["description"], s.get("type", "cmd"),
+                    s.get("action"), s.get("validation"), s.get("rollback"),
+                    s.get("files_read", []), s.get("files_write", []),
+                )
             self._wf.current_step = 0
             self._wf.status = WFStatus.EXECUTING
         else:
@@ -196,11 +207,11 @@ class WorkflowOrchestrator:
         if not self._wf:
             return
         for s in steps:
-            self._wf.add_step(s["description"], s.get("type", "cmd"),
-                              s.get("action"), s.get("validation"), s.get("rollback"))
-        self._wf.current_step = 0
-        self._wf.status = WFStatus.EXECUTING
-        self._wf.save()
+            self._wf.add_step(
+                s["description"], s.get("type", "cmd"),
+                s.get("action"), s.get("validation"), s.get("rollback"),
+                s.get("files_read", []), s.get("files_write", []),
+            )
 
     def begin_step(self):
         if not self._wf:
@@ -299,3 +310,130 @@ class WorkflowOrchestrator:
             if s.error:
                 lines.append(f"    X  {str(s.error)[:100]}")
         return "\n".join(lines)
+
+    # ====================================================================
+    # 并行执行：自动分析可并行的步骤组
+    # ====================================================================
+
+    def _extract_files(self, text):
+        """从描述中提取文件路径（简单启发式）"""
+        patterns = [
+            r'(?:src/|lib/|app/|tools/|scripts/|config/|data/|models/)[^\s]+\.py',
+            r'(?:src/|lib/|app/|components/)[^\s]+\.[jt]sx?',
+            r'(?:public/|static/|assets/)[^\s]+\.[a-z]+',
+            r'[A-Za-z]:[\\\/][^\s:]+\.[a-z]+',
+            r'[./][^\s]+\.py',
+            r'[./][^\s]+\.js',
+            r'[./][^\s]+\.json',
+            r'[./][^\s]+\.yaml',
+            r'[./][^\s]+\.csv',
+            r'[./][^\s]+\.md',
+        ]
+        files = set()
+        for pat in patterns:
+            for m in re.findall(pat, text, re.IGNORECASE):
+                files.add(m.lower())
+        return files
+
+    def _file_conflicts(self, files_a, files_b):
+        """检查两个步骤是否有文件冲突（一个读一个写同一文件）"""
+        for fa in files_a:
+            for fb in files_b:
+                # 完全相同
+                if fa == fb:
+                    return True
+                # 一个是另一个的前缀（如 "src" vs "src/a.py"）
+                if fa.startswith(fb.rsplit('.', 1)[0]) or fb.startswith(fa.rsplit('.', 1)[0]):
+                    return True
+        return False
+
+    def compute_parallel_groups(self):
+        """
+        分析所有 PENDING 步骤，计算可并行的组。
+        原则：write↔write、read↔read、cmd↔cmd 之间无文件冲突时可以并行。
+        Returns: list of [step_id, ...] 组列表
+        """
+        pending = [s for s in self._wf.steps if s.status == StepStatus.PENDING]
+        if not pending:
+            return []
+
+        # 提取每个步骤的文件
+        for s in pending:
+            if not s.files_write and not s.files_read:
+                s.files_write = list(self._extract_files(s.description))
+            if not s.files_read and not s.files_write:
+                s.files_read = list(self._extract_files(s.description))
+
+        groups = []
+        used = set()
+        # 第一次：同 type 的 PENDING 步骤
+        for t in ("write", "cmd", "read"):
+            group = [s for s in pending if s.type == t and s.id not in used]
+            conflict = False
+            for i, s1 in enumerate(group):
+                for s2 in group[i+1:]:
+                    all_f1 = set(s1.files_read) | set(s1.files_write)
+                    all_f2 = set(s2.files_read) | set(s2.files_write)
+                    if self._file_conflicts(all_f1, all_f2):
+                        conflict = True
+                        break
+                if conflict:
+                    break
+            if group and not conflict:
+                groups.append([s.id for s in group])
+                used.update(s.id for s in group)
+
+        # 第二次：剩余的单独成组
+        for s in pending:
+            if s.id not in used:
+                groups.append([s.id])
+                used.add(s.id)
+
+        return groups
+
+    def begin_parallel_group(self):
+        """
+        开始下一个可并行的步骤组。
+        Returns: list of Step 对象
+        """
+        groups = self.compute_parallel_groups()
+        if not groups:
+            return []
+        group_ids = groups[0]
+        steps = []
+        for sid in group_ids:
+            for s in self._wf.steps:
+                if s.id == sid:
+                    s.status = StepStatus.EXECUTING
+                    s.attempts += 1
+                    steps.append(s)
+        if steps:
+            self._wf.status = WFStatus.EXECUTING
+            # 第一个步骤设为 current_step
+            self._wf.current_step = steps[0].id
+            self._wf.save()
+        return steps
+
+    def complete_step_by_id(self, step_id, result="", error=None):
+        """完成指定 ID 的步骤（并行模式下使用）"""
+        for s in self._wf.steps:
+            if s.id == step_id:
+                if error:
+                    s.status = StepStatus.FAILED
+                    s.error = error
+                    self._wf.add_history("step_failed", f"step={s.id} error={str(error)[:100]}")
+                else:
+                    s.status = StepStatus.DONE
+                    s.result = result
+                    s.finished_at = datetime.now(timezone.utc).isoformat()
+                    self._wf.add_history("step_done", f"step={s.id}")
+                self._wf.save()
+                # 检查是否全部完成
+                all_done = all(st.status in (StepStatus.DONE, StepStatus.SKIPPED, StepStatus.FAILED)
+                               for st in self._wf.steps)
+                if all_done:
+                    self._wf.status = WFStatus.DONE
+                    self._wf.add_history("workflow_done", "all steps completed")
+                    self._wf.save()
+                return
+
