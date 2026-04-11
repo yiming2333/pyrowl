@@ -222,6 +222,7 @@ class WorkflowOrchestrator:
             step.attempts += 1
             self._wf.status = WFStatus.EXECUTING
             self._wf.current_step = step.id
+            self._wf.add_history("step_started", f"step={step.id}")
             self._wf.save()
         return step
 
