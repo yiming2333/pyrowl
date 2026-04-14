@@ -438,3 +438,147 @@ class WorkflowOrchestrator:
                     self._wf.save()
                 return
 
+    # ========================================================================
+    # 自动推进：report_step_result / skip_step
+    # ========================================================================
+
+    def report_step_result(self, success: bool, output: str = None, error: str = None) -> dict:
+        """
+        报告当前步骤执行结果，自动推进到下一步。
+
+        Args:
+            success: 步骤是否成功执行
+            output: 步骤输出（字符串或 dict）
+            error: 错误信息
+
+        Returns:
+            dict，含下一步执行指令或 workflow_done
+        """
+        from .persistence import persist_context, clear_context
+
+        if not self._wf:
+            return {"action": "error", "message": "No active workflow"}
+
+        current = self._wf.current_step_obj()
+        if not current:
+            return {"action": "error", "message": "No current step"}
+
+        if success:
+            self.complete_step(output or "OK")
+            # 推进到下一步
+            next_step = self._wf.next_step_obj()
+            if not next_step:
+                self._wf.status = WFStatus.DONE
+                self._wf.add_history("workflow_done", "all steps completed")
+                self._wf.save()
+                clear_context()
+                return {
+                    "action": "workflow_done",
+                    "message": "Workflow 完成！",
+                    "workflow": {"id": self._wf.id, "status": "DONE"},
+                }
+            else:
+                # begin_step 设置为 EXECUTING
+                self.begin_step()
+                persist_context(self, pending_action="execute_step")
+                return _build_step_response(self, self._wf.current_step_obj(), "execute_step")
+        else:
+            # 失败处理
+            if current.attempts < 3:
+                # 重试
+                self._wf.add_history("step_retry", f"step={current.id} attempts={current.attempts}")
+                persist_context(self, pending_action="execute_step")
+                return {
+                    "action": "retry_step",
+                    "message": f"Step {current.id + 1} failed, retrying...",
+                    "step": {
+                        "id": current.id,
+                        "type": current.type.value,
+                        "description": current.description,
+                        "attempts": current.attempts,
+                    },
+                    "error": error,
+                }
+            else:
+                # 超过重试次数 → 跳过
+                current.status = StepStatus.SKIPPED
+                current.result = f"SKIPPED after {current.attempts} retries: {error}"
+                self._wf.add_history("step_skipped", f"step={current.id} reason=max_retries")
+                self._wf.save()
+                # 继续推进
+                return self.skip_step("max retries exceeded")
+
+    def skip_step(self, reason: str = "User skipped") -> dict:
+        """
+        跳过当前步骤，推进到下一步。
+
+        Args:
+            reason: 跳过原因
+
+        Returns:
+            dict，含下一步执行指令或 workflow_done
+        """
+        from .persistence import persist_context, clear_context
+
+        if not self._wf:
+            return {"action": "error", "message": "No active workflow"}
+
+        current = self._wf.current_step_obj()
+        if current:
+            current.status = StepStatus.SKIPPED
+            current.result = f"SKIPPED: {reason}"
+            self._wf.add_history("step_skipped", f"step={current.id} reason={reason}")
+            self._wf.save()
+
+        # 推进到下一步
+        next_step = self._wf.next_step_obj()
+        if not next_step:
+            self._wf.status = WFStatus.DONE
+            self._wf.add_history("workflow_done", "all steps skipped or completed")
+            self._wf.save()
+            clear_context()
+            return {
+                "action": "workflow_done",
+                "message": "Workflow 完成！",
+                "workflow": {"id": self._wf.id, "status": "DONE"},
+            }
+        else:
+            self.begin_step()
+            persist_context(self, pending_action="execute_step")
+            return _build_step_response(self, self._wf.current_step_obj(), "execute_step")
+
+
+def _build_step_response(orch, step, action: str) -> dict:
+    """构建步骤执行响应"""
+    from .persistence import persist_context
+
+    if not step:
+        return {"action": "workflow_done", "message": "No more steps"}
+
+    progress = f"{step.id + 1}/{len(orch._wf.steps)}"
+    icon = {"read": "📖", "write": "✏️", "cmd": "⚡", "browse": "🌐", "skill": "🔧"}.get(
+        step.type.value, "▶"
+    )
+
+    persist_context(orch, pending_action="execute_step")
+
+    return {
+        "action": action,
+        "message": f"{icon} [{progress}] {step.description[:60]}",
+        "progress": progress,
+        "step": {
+            "id": step.id,
+            "type": step.type.value,
+            "description": step.description,
+            "files_read": getattr(step, "files_read", []),
+            "files_write": getattr(step, "files_write", []),
+            "action": getattr(step, "action", None),
+            "validation": getattr(step, "validation", {}),
+        },
+        "workflow": {
+            "id": orch._wf.id,
+            "progress": progress,
+            "task": orch._wf.task,
+        },
+    }
+
