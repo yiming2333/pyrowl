@@ -242,21 +242,13 @@ class WorkflowOrchestrator:
             step.finished_at = datetime.now(timezone.utc).isoformat()
             self._wf.add_history("step_done", f"step={step.id}")
         # Check if all steps are done → mark workflow as DONE
-        all_done = all(s.status == StepStatus.DONE or s.status == StepStatus.SKIPPED
+        # 注意：含 FAILED 的步骤也视为终态（不会再执行）
+        all_done = all(s.status in (StepStatus.DONE, StepStatus.SKIPPED, StepStatus.FAILED)
                        for s in self._wf.steps)
         if all_done:
             self._wf.status = WFStatus.DONE
             self._wf.add_history("workflow_done", "all steps completed")
         self._wf.save()
-
-    def skip_step(self):
-        if not self._wf:
-            return
-        step = self._wf.current_step_obj()
-        if step:
-            step.status = StepStatus.SKIPPED
-            self._wf.add_history("step_skipped", f"step={step.id}")
-            self._wf.save()
 
     def abort(self, reason=""):
         if not self._wf:
